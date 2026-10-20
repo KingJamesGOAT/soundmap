@@ -1,0 +1,22 @@
+# Fichiers d'environnement (secrets à ne jamais commiter)
+.env
+.env.local
+
+# Dépendances Node.js
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Rapports de couverture de tests
+coverage/
+
+# Fichiers de configuration des éditeurs et OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
