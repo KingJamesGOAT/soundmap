@@ -3,48 +3,74 @@ import { config } from '../config.js';
 
 /**
  * Middleware d'authentification par JSON Web Token (JWT).
+ * Conforme aux standards enseignés par le cours COMEM+ ArchiOWeb.
  * 
  * Rôle :
  * 1. Vérifie la présence du header HTTP "Authorization" sous la forme "Bearer <token>".
- * 2. Vérifie la validité cryptographique et l'expiration du token avec la clé secrète.
- * 3. Si valide, extrait les données du payload (ex: userId, role) et les injecte dans `req.user`.
- * 4. Si manquant ou invalide, interrompt la requête avec un code HTTP 401 (Unauthorized).
+ * 2. Vérifie la signature cryptographique et l'expiration du jeton avec config.jwtSecret.
+ * 3. En cas de succès, injecte les informations dans la requête :
+ *    - req.user (payload complet du JWT : userId, username, role)
+ *    - req.currentUserId (identifiant standardisé string pour les comparaisons directes)
+ *    - req.currentUserPermissions (tableau des permissions/rôles, ex: ['user'] ou ['admin'])
+ * 4. En cas d'échec (token manquant, malformé ou expiré), renvoie une réponse 401 Unauthorized
+ *    avec l'en-tête standard "WWW-Authenticate: Bearer".
  */
 export function authenticate(req, res, next) {
   // Récupération de l'en-tête Authorization
-  const authHeader = req.headers.authorization;
+  const authorization = req.get('Authorization') || req.headers.authorization;
 
-  if (!authHeader) {
-    return res.status(401).json({
-      error: 'Accès refusé. Aucun en-tête d’autorisation fourni (format requis: Authorization: Bearer <token>).'
-    });
+  if (!authorization) {
+    return res
+      .status(401)
+      .set('WWW-Authenticate', 'Bearer')
+      .json({
+        error: "Accès refusé. Un jeton d'authentification est requis (Authorization: Bearer <token>)."
+      });
   }
 
-  // Vérification de la structure "Bearer <token>"
-  const parts = authHeader.split(' ');
-  if (parts.length !== 2 || parts[0] !== 'Bearer') {
-    return res.status(401).json({
-      error: 'Format du jeton invalide. Le format attendu est "Bearer <token>".'
-    });
+  // Vérification de la structure "Bearer <token>" via expression régulière
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return res
+      .status(401)
+      .set('WWW-Authenticate', 'Bearer')
+      .json({
+        error: 'Format du jeton invalide. Le format attendu est "Bearer <token>".'
+      });
   }
 
-  const token = parts[1];
+  const token = match[1];
 
   try {
     // Décodage et vérification de la signature du JWT
-    const decoded = jwt.verify(token, config.jwtSecret);
+    const payload = jwt.verify(token, config.jwtSecret);
 
-    // On attache les informations du payload à l'objet requête pour les middlewares/routes suivants
-    // Par exemple : req.user = { userId: "...", username: "...", role: "admin" }
-    req.user = decoded;
+    // Extraction et normalisation de l'identifiant utilisateur (sub ou userId)
+    const userId = payload.sub || payload.userId;
+    const role = payload.role || payload.scope || 'user';
 
-    // Passage au middleware ou contrôleur suivant
+    // Injection dans req pour une compatibilité maximale dans toute l'application
+    req.user = {
+      userId,
+      username: payload.username,
+      role
+    };
+
+    // Identifiant string direct (recommandé par le cours des profs Simon & Loris)
+    req.currentUserId = userId ? String(userId) : undefined;
+
+    // Tableau de permissions (pour vérification rapide dans les autres routes)
+    req.currentUserPermissions = role === 'admin' ? ['admin', 'user'] : ['user'];
+
     next();
   } catch (err) {
-    return res.status(401).json({
-      error: 'Jeton JWT invalide ou expiré. Veuillez vous reconnecter.',
-      details: err.message
-    });
+    return res
+      .status(401)
+      .set('WWW-Authenticate', 'Bearer')
+      .json({
+        error: 'Jeton JWT invalide ou expiré. Veuillez vous reconnecter.',
+        details: err.message
+      });
   }
 }
 
@@ -54,17 +80,21 @@ export function authenticate(req, res, next) {
  * ⚠️ ATTENTION : Doit impérativement être placé APRÈS le middleware `authenticate` dans la chaîne Express.
  * 
  * Rôle :
- * 1. Vérifie que `req.user` existe et que son rôle est bien 'admin'.
+ * 1. Vérifie que la requête est authentifiée et que l'utilisateur possède le rôle 'admin'.
  * 2. Si ce n'est pas le cas, interrompt la requête avec un code HTTP 403 (Forbidden).
  */
 export function requireAdmin(req, res, next) {
-  // Si authenticate n'a pas été appelé ou si le rôle n'est pas admin
-  if (!req.user || req.user.role !== 'admin') {
+  const isAdmin =
+    req.user?.role === 'admin' ||
+    req.currentUserPermissions?.includes('admin');
+
+  if (!isAdmin) {
     return res.status(403).json({
       error: 'Accès interdit. Cette action nécessite des privilèges administrateur.'
     });
   }
 
-  // L'utilisateur est bien un administrateur authentifié, on poursuit
   next();
 }
+
+export default { authenticate, requireAdmin };

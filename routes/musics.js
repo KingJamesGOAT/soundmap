@@ -1,140 +1,319 @@
 import { Router } from 'express';
 import { authenticate } from '../middlewares/auth.js';
+import Music from '../models/Music.js';
+import Zone from '../models/Zone.js';
 
 const router = Router();
 
 /**
  * ============================================================================
  * FICHIER DE ROUTES : MUSIQUES & VOTES
- * ATTRIBUÉ À : Ryad & Nabil
+ * ATTRIBUÉ À : Ryad (Création, modification, suppression, votes, validation GPS)
+ *              & Nabil (Consultation paginée et filtres)
  * ============================================================================
- * Ce module gère la liste, le dépôt, la modification, la suppression et les votes
- * sur les morceaux de musique partagés dans les différentes zones.
  */
 
 /**
- * @route   GET /api/musics
- * @desc    Récupérer les musiques avec pagination et filtres
- * @access  Public
- * @dev     Nabil
+ * Calcule la distance géodésique en mètres entre deux coordonnées géographiques [lng, lat]
+ * en utilisant la formule standard de Haversine.
  * 
- * Cahier des charges pour Nabil :
- * 1. Extraire les paramètres de requête :
- *    - Pagination : `page` (défaut 1), `limit` (défaut 10).
- *    - Filtres : `zone` (ID de zone) et `genre` (ex: "Rock", "Electro").
- * 2. Construire un filtre Mongoose dynamique :
- *    const query = {};
- *    if (req.query.zone) query.zone = req.query.zone;
- *    if (req.query.genre) query.genre = new RegExp(`^${req.query.genre}$`, 'i');
- * 3. Appliquer `.skip((page - 1) * limit).limit(Number(limit))` avec un tri `.sort({ createdAt: -1 })`.
- * 4. Peupler les références utiles : `.populate('postedBy', 'username').populate('zone', 'name')`.
- * 5. Retourner les données avec le décompte total des éléments pour la pagination (statut 200).
+ * ⚠️ RAPPEL GÉOSPATIAL : L'ordre des coordonnées est toujours [LONGITUDE, LATITUDE] !
+ * 
+ * @param {[number, number]} coord1 - [lng1, lat1]
+ * @param {[number, number]} coord2 - [lng2, lat2]
+ * @returns {number} Distance en mètres
  */
-router.get('/', (req, res) => {
-  res.status(501).json({
-    message: "Route de liste paginée des musiques non implémentée (Attribuée à Nabil).",
-    route: "GET /api/musics"
-  });
-});
+function calculateDistanceInMeters(coord1, coord2) {
+  const [lng1, lat1] = coord1;
+  const [lng2, lat2] = coord2;
+
+  const EARTH_RADIUS_METERS = 6371000;
+  const toRadians = (degrees) => (degrees * Math.PI) / 180;
+
+  const dLat = toRadians(lat2 - lat1);
+  const dLng = toRadians(lng2 - lng1);
+
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRadians(lat1)) *
+      Math.cos(toRadians(lat2)) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return EARTH_RADIUS_METERS * c;
+}
 
 /**
  * @route   GET /api/musics/:id
- * @desc    Récupérer les détails d'un morceau musical spécifique
+ * @desc    Récupérer les détails complets d'un morceau musical
  * @access  Public
- * @dev     Ryad & Nabil
  */
-router.get('/:id', (req, res) => {
-  res.status(501).json({
-    message: "Route de détail d'une musique non implémentée (Attribuée à Ryad & Nabil).",
-    route: "GET /api/musics/:id"
-  });
+router.get('/:id', async (req, res, next) => {
+  try {
+    const music = await Music.findById(req.params.id)
+      .populate('postedBy', 'username role')
+      .populate('zone', 'name location radius');
+
+    if (!music) {
+      return res.status(404).json({
+        error: `Aucune musique trouvée avec l'identifiant ${req.params.id}.`
+      });
+    }
+
+    return res.status(200).json(music);
+  } catch (err) {
+    return next(err);
+  }
 });
 
 /**
  * @route   POST /api/musics
- * @desc    Déposer une nouvelle musique dans une zone avec validation GPS
+ * @desc    Déposer une nouvelle recommandation musicale dans une zone avec contrôle GPS strict
  * @access  Privé (authenticate)
  * @dev     Ryad
- * 
- * Cahier des charges pour Ryad :
- * 1. Protégé par `authenticate` (l'auteur est `req.user.userId`).
- * 2. Récupérer dans `req.body` : `title`, `artist`, `genre`, `links`, `zoneId`, et les coordonnées GPS
- *    actuelles de l'utilisateur mobile : `userLng` et `userLat`.
- * 3. ⚠️ VÉRIFICATION GÉOGRAPHIQUE CRITIQUE :
- *    - Charger la zone cible via `Zone.findById(zoneId)`.
- *    - Vérifier que la position GPS fournie par le smartphone se situe bien à l'intérieur
- *      du rayon géographique de la zone (calcul de distance sphérique type formule de Haversine
- *      ou requête géospatiale MongoDB).
- *    - Si l'utilisateur est trop éloigné, renvoyer un code 403 Forbidden ("Vous devez être physiquement dans la zone pour y poster une musique").
- * 4. Si la condition GPS est respectée, sauvegarder la musique avec `postedBy: req.user.userId`.
- * 5. Retourner la musique créée avec le statut 201.
  */
-router.post('/', authenticate, (req, res) => {
-  res.status(501).json({
-    message: "Route de dépôt d'une musique avec vérification GPS non implémentée (Attribuée à Ryad).",
-    route: "POST /api/musics"
-  });
+router.post('/', authenticate, async (req, res, next) => {
+  try {
+    const { title, artist, genre, url, links, zoneId, userCoordinates } = req.body ?? {};
+
+    // 1. Validation des champs textuels obligatoires
+    if (!title || typeof title !== 'string' || title.trim().length === 0) {
+      return res.status(400).json({ error: 'Le titre de la musique est obligatoire.' });
+    }
+    if (!artist || typeof artist !== 'string' || artist.trim().length === 0) {
+      return res.status(400).json({ error: "L'artiste de la musique est obligatoire." });
+    }
+    if (!url || typeof url !== 'string' || url.trim().length === 0) {
+      return res.status(400).json({ error: "L'URL de la musique est obligatoire." });
+    }
+    if (!zoneId) {
+      return res.status(400).json({ error: "L'identifiant de la zone (zoneId) est obligatoire." });
+    }
+
+    // 2. Vérification obligatoire de l'existence de la Zone liée (Exigence officielle Simon & Loris)
+    const targetZone = await Zone.findById(zoneId);
+    if (!targetZone) {
+      return res.status(404).json({
+        error: `La zone spécifiée avec l'identifiant "${zoneId}" n'existe pas.`
+      });
+    }
+
+    // 3. Validation de la géolocalisation de l'utilisateur
+    if (
+      !Array.isArray(userCoordinates) ||
+      userCoordinates.length !== 2 ||
+      typeof userCoordinates[0] !== 'number' ||
+      typeof userCoordinates[1] !== 'number'
+    ) {
+      return res.status(400).json({
+        error: 'Les coordonnées GPS de l’utilisateur sont requises sous la forme [longitude, latitude].'
+      });
+    }
+
+    const [userLng, userLat] = userCoordinates;
+    if (userLng < -180 || userLng > 180 || userLat < -90 || userLat > 90) {
+      return res.status(400).json({
+        error: 'Coordonnées GPS hors limites valides (-180 <= lng <= 180, -90 <= lat <= 90).'
+      });
+    }
+
+    // Calcul de la distance entre l'utilisateur et le centre de la zone
+    const zoneCenterCoords = targetZone.location.coordinates;
+    const distanceMeters = calculateDistanceInMeters([userLng, userLat], zoneCenterCoords);
+    const maxRadius = targetZone.radius || 500;
+
+    if (distanceMeters > maxRadius) {
+      return res.status(400).json({
+        error: `Dépôt refusé : vous êtes situé à environ ${Math.round(distanceMeters)}m du centre de la zone, ce qui dépasse son rayon autorisé de ${maxRadius}m.`,
+        distanceInMeters: Math.round(distanceMeters),
+        maxRadiusAllowed: maxRadius
+      });
+    }
+
+    // 4. Création de la ressource musicale
+    const authorId = req.currentUserId || req.user?.userId;
+    const music = new Music({
+      title: title.trim(),
+      artist: artist.trim(),
+      genre: genre ? genre.trim() : 'Autre',
+      url: url.trim(),
+      links: links || {},
+      zone: targetZone._id,
+      postedBy: authorId,
+      upvotes: [],
+      downvotes: []
+    });
+
+    await music.save();
+
+    return res.status(201).json(music);
+  } catch (err) {
+    return next(err);
+  }
 });
 
 /**
  * @route   PATCH /api/musics/:id
- * @desc    Modifier les informations d'un morceau (titre, liens, genre)
- * @access  Privé - Auteur du post ou Administrateur (authenticate)
+ * @desc    Mettre à jour les informations d'un morceau musical
+ * @access  Privé - Auteur du morceau ou Administrateur (authenticate)
  * @dev     Ryad
- * 
- * Cahier des charges pour Ryad :
- * 1. Charger la musique par son ID.
- * 2. Vérifier que l'utilisateur connecté (`req.user.userId`) est bien le propriétaire (`music.postedBy`)
- *    OU que l'utilisateur est un admin (`req.user.role === 'admin'`).
- * 3. Si non autorisé, renvoyer 403 Forbidden.
- * 4. Mettre à jour les champs autorisés et sauvegarder.
- * 5. Renvoyer la musique modifiée avec le code 200.
  */
-router.patch('/:id', authenticate, (req, res) => {
-  res.status(501).json({
-    message: "Route de mise à jour d'une musique non implémentée (Attribuée à Ryad).",
-    route: "PATCH /api/musics/:id"
-  });
+router.patch('/:id', authenticate, async (req, res, next) => {
+  try {
+    const music = await Music.findById(req.params.id);
+    if (!music) {
+      return res.status(404).json({
+        error: `Aucune musique trouvée avec l'identifiant ${req.params.id}.`
+      });
+    }
+
+    // Vérification stricte des autorisations : Seul l'auteur ou un admin peut modifier
+    const currentUserId = req.currentUserId || req.user?.userId;
+    const isOwner = music.postedBy.toString() === currentUserId;
+    const isAdmin =
+      req.user?.role === 'admin' ||
+      req.currentUserPermissions?.includes('admin');
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({
+        error: 'Accès interdit. Vous ne pouvez modifier que les musiques que vous avez publiées.'
+      });
+    }
+
+    const { title, artist, genre, url, links } = req.body ?? {};
+
+    if (title && typeof title === 'string') music.title = title.trim();
+    if (artist && typeof artist === 'string') music.artist = artist.trim();
+    if (genre && typeof genre === 'string') music.genre = genre.trim();
+    if (url && typeof url === 'string') music.url = url.trim();
+    if (links && typeof links === 'object') {
+      music.links = { ...music.links, ...links };
+    }
+
+    await music.save();
+
+    return res.status(200).json(music);
+  } catch (err) {
+    return next(err);
+  }
 });
 
 /**
  * @route   DELETE /api/musics/:id
  * @desc    Supprimer un morceau musical
- * @access  Privé - Auteur du post ou Administrateur (authenticate)
+ * @access  Privé - Auteur du morceau ou Administrateur (authenticate)
  * @dev     Ryad
- * 
- * Cahier des charges pour Ryad :
- * 1. Charger la musique avec `Music.findById(req.params.id)`.
- * 2. Vérifier l'autorisation : seul l'auteur du dépôt (`music.postedBy.toString() === req.user.userId`)
- *    ou un administrateur (`req.user.role === 'admin'`) a le droit de supprimer.
- * 3. Supprimer le document et renvoyer une confirmation avec le statut 200 (ou 204).
  */
-router.delete('/:id', authenticate, (req, res) => {
-  res.status(501).json({
-    message: "Route de suppression d'une musique non implémentée (Attribuée à Ryad).",
-    route: "DELETE /api/musics/:id"
-  });
+router.delete('/:id', authenticate, async (req, res, next) => {
+  try {
+    const music = await Music.findById(req.params.id);
+    if (!music) {
+      return res.status(404).json({
+        error: `Aucune musique trouvée avec l'identifiant ${req.params.id}.`
+      });
+    }
+
+    const currentUserId = req.currentUserId || req.user?.userId;
+    const isOwner = music.postedBy.toString() === currentUserId;
+    const isAdmin =
+      req.user?.role === 'admin' ||
+      req.currentUserPermissions?.includes('admin');
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({
+        error: 'Accès interdit. Vous ne pouvez supprimer que les musiques que vous avez publiées.'
+      });
+    }
+
+    await Music.findByIdAndDelete(req.params.id);
+
+    return res.status(204).send();
+  } catch (err) {
+    return next(err);
+  }
 });
 
 /**
  * @route   POST /api/musics/:id/vote
- * @desc    Voter pour une musique (pouce haut ou pouce bas)
+ * @desc    Système de vote interactif (upvote / downvote)
  * @access  Privé (authenticate)
  * @dev     Ryad
- * 
- * Cahier des charges pour Ryad :
- * 1. Récupérer le type de vote dans `req.body.type` : 'up' ou 'down'.
- * 2. Récupérer l'identifiant de l'utilisateur : `const userId = req.user.userId`.
- * 3. Logique de bascule (toggle) :
- *    - Si type === 'up' : ajouter `userId` à `upvotes` (avec $addToSet) et le retirer de `downvotes` ($pull).
- *    - Si type === 'down' : ajouter `userId` à `downvotes` (avec $addToSet) et le retirer de `upvotes` ($pull).
- *    - Gérer le cas où l'utilisateur reclique sur le même vote pour l'annuler.
- * 4. Renvoyer le score de votes mis à jour avec le statut 200.
  */
-router.post('/:id/vote', authenticate, (req, res) => {
+router.post('/:id/vote', authenticate, async (req, res, next) => {
+  try {
+    const { type } = req.body ?? {};
+
+    const normalizedType =
+      type === 'up' || type === 'upvote'
+        ? 'up'
+        : type === 'down' || type === 'downvote'
+        ? 'down'
+        : null;
+
+    if (!normalizedType) {
+      return res.status(400).json({
+        error: 'Type de vote invalide. Les valeurs acceptées sont "up" (ou "upvote") et "down" (ou "downvote").'
+      });
+    }
+
+    const music = await Music.findById(req.params.id);
+    if (!music) {
+      return res.status(404).json({
+        error: `Aucune musique trouvée avec l'identifiant ${req.params.id}.`
+      });
+    }
+
+    const currentUserId = req.currentUserId || req.user?.userId;
+
+    const upvotesList = (music.upvotes || []).map((id) => id.toString());
+    const downvotesList = (music.downvotes || []).map((id) => id.toString());
+
+    const hasUpvoted = upvotesList.includes(currentUserId);
+    const hasDownvoted = downvotesList.includes(currentUserId);
+
+    if (normalizedType === 'up') {
+      if (hasUpvoted) {
+        music.upvotes = music.upvotes.filter((id) => id.toString() !== currentUserId);
+      } else {
+        music.upvotes.push(currentUserId);
+        if (hasDownvoted) {
+          music.downvotes = music.downvotes.filter((id) => id.toString() !== currentUserId);
+        }
+      }
+    } else {
+      if (hasDownvoted) {
+        music.downvotes = music.downvotes.filter((id) => id.toString() !== currentUserId);
+      } else {
+        music.downvotes.push(currentUserId);
+        if (hasUpvoted) {
+          music.upvotes = music.upvotes.filter((id) => id.toString() !== currentUserId);
+        }
+      }
+    }
+
+    await music.save();
+
+    return res.status(200).json({
+      message: 'Vote enregistré avec succès.',
+      musicId: music._id,
+      score: music.score,
+      upvotesCount: music.upvotes.length,
+      downvotesCount: music.downvotes.length
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+/**
+ * STUB POUR NABIL (GET /api/musics)
+ */
+router.get('/', (req, res) => {
   res.status(501).json({
-    message: "Route de vote (upvote / downvote) non implémentée (Attribuée à Ryad).",
-    route: "POST /api/musics/:id/vote"
+    message: "Route de liste paginée des musiques non implémentée (Attribuée à Nabil).",
+    route: "GET /api/musics"
   });
 });
 
