@@ -784,3 +784,328 @@ describe('API SoundMap - Tests Consultation Paginée & Statistiques (Nabil)', ()
     });
   });
 });
+
+describe('API SoundMap - Tests Zones Géographiques & Administration (Luka)', () => {
+  let userToken;
+  let adminToken;
+  let adminProfile;
+  let zoneYverdon;
+  let zoneLausanne;
+
+  // Identifiant valide mais qui ne correspond à aucune zone en base
+  const unknownId = new mongoose.Types.ObjectId().toString();
+
+  // Corps de requête valide pour la création d'une zone (format GeoJSON standard)
+  const newZoneBody = () => ({
+    name: 'Gare de Genève Cornavin',
+    description: 'Hall principal de la gare',
+    location: { type: 'Point', coordinates: [6.1424, 46.2102] },
+    radius: 250
+  });
+
+  beforeEach(async () => {
+    // Création d'un membre classique et d'un administrateur, puis récupération de leurs jetons
+    await request(app)
+      .post('/api/users')
+      .send({ username: 'lukaUser', password: 'password123' });
+    const loginUser = await request(app)
+      .post('/api/auth/login')
+      .send({ username: 'lukaUser', password: 'password123' });
+    userToken = loginUser.body.token;
+
+    const resAdmin = await request(app)
+      .post('/api/users')
+      .send({ username: 'lukaAdmin', password: 'adminPassword123', role: 'admin' });
+    adminProfile = resAdmin.body;
+    const loginAdmin = await request(app)
+      .post('/api/auth/login')
+      .send({ username: 'lukaAdmin', password: 'adminPassword123' });
+    adminToken = loginAdmin.body.token;
+
+    // Deux zones de départ avec des dates de création distinctes (pour tester le tri)
+    zoneYverdon = await Zone.create({
+      name: 'HEIG-VD Yverdon',
+      location: { type: 'Point', coordinates: [6.6412, 46.7785] },
+      radius: 500,
+      createdBy: adminProfile._id,
+      createdAt: new Date('2026-01-01T10:00:00Z')
+    });
+    zoneLausanne = await Zone.create({
+      name: 'Place Chauderon',
+      location: { type: 'Point', coordinates: [6.6243, 46.5225] },
+      radius: 300,
+      createdBy: adminProfile._id,
+      createdAt: new Date('2026-02-01T10:00:00Z')
+    });
+
+    // S'assure que les index (2dsphere, unicité du nom) existent avant les requêtes
+    await Zone.syncIndexes();
+  });
+
+  describe('Modèle Zone (sous-schéma GeoJSON)', () => {
+    it('devrait refuser une longitude hors limites lors de la validation Mongoose', async () => {
+      const zone = new Zone({
+        name: 'Zone invalide',
+        location: { type: 'Point', coordinates: [200, 46] },
+        createdBy: adminProfile._id
+      });
+      await expect(zone.validate()).rejects.toThrow(/Coordonnées invalides/);
+    });
+
+    it('devrait appliquer un rayon de 500 m par défaut et ne pas exposer __v ni d’_id dans location', async () => {
+      const zone = await Zone.create({
+        name: 'Zone par défaut',
+        location: { coordinates: [6.5, 46.5] },
+        createdBy: adminProfile._id
+      });
+      const json = zone.toJSON();
+      expect(json.radius).toBe(500);
+      expect(json.location).toEqual({ type: 'Point', coordinates: [6.5, 46.5] });
+      expect(json).not.toHaveProperty('__v');
+    });
+  });
+
+  describe('GET /api/zones', () => {
+    it('devrait renvoyer la liste des zones triée de la plus récente à la plus ancienne (200)', async () => {
+      const response = await request(app).get('/api/zones');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveLength(2);
+      expect(response.body[0].name).toBe('Place Chauderon');
+      expect(response.body[1].name).toBe('HEIG-VD Yverdon');
+      // Le créateur est peuplé sans données sensibles
+      expect(response.body[0].createdBy).toHaveProperty('username', 'lukaAdmin');
+      expect(response.body[0].createdBy).not.toHaveProperty('passwordHash');
+      expect(response.body[0]).not.toHaveProperty('__v');
+    });
+
+    it('devrait trier les zones par proximité avec ?near=lng,lat (200)', async () => {
+      // Point situé à Lausanne : Chauderon doit être la première zone renvoyée
+      const response = await request(app).get('/api/zones?near=6.63,46.52');
+
+      expect(response.status).toBe(200);
+      expect(response.body.map((z) => z.name)).toEqual(['Place Chauderon', 'HEIG-VD Yverdon']);
+    });
+
+    it('devrait limiter les résultats avec ?maxDistance (en mètres)', async () => {
+      // Yverdon est à ~29 km de Lausanne : seule Chauderon reste dans un rayon de 5 km
+      const response = await request(app).get('/api/zones?near=6.63,46.52&maxDistance=5000');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveLength(1);
+      expect(response.body[0].name).toBe('Place Chauderon');
+    });
+
+    it('devrait rejeter un paramètre near invalide avec un code 400', async () => {
+      const response = await request(app).get('/api/zones?near=6.63,120');
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error');
+    });
+
+    it('devrait rejeter un maxDistance invalide avec un code 400', async () => {
+      const response = await request(app).get('/api/zones?near=6.63,46.52&maxDistance=-10');
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error');
+    });
+  });
+
+  describe('GET /api/zones/:id', () => {
+    it('devrait renvoyer les détails d’une zone existante (200)', async () => {
+      const response = await request(app).get(`/api/zones/${zoneYverdon._id}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveProperty('name', 'HEIG-VD Yverdon');
+      expect(response.body.location).toEqual({ type: 'Point', coordinates: [6.6412, 46.7785] });
+      expect(response.body.createdBy).toHaveProperty('username', 'lukaAdmin');
+    });
+
+    it('devrait renvoyer 404 si la zone n’existe pas', async () => {
+      const response = await request(app).get(`/api/zones/${unknownId}`);
+      expect(response.status).toBe(404);
+      expect(response.body).toHaveProperty('error');
+    });
+
+    it('devrait renvoyer 400 si l’identifiant est mal formé', async () => {
+      const response = await request(app).get('/api/zones/identifiant-invalide');
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error');
+    });
+  });
+
+  describe('POST /api/zones', () => {
+    it('devrait permettre à un administrateur de créer une zone (201)', async () => {
+      const response = await request(app)
+        .post('/api/zones')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send(newZoneBody());
+
+      expect(response.status).toBe(201);
+      expect(response.body).toHaveProperty('_id');
+      expect(response.body).toHaveProperty('name', 'Gare de Genève Cornavin');
+      expect(response.body).toHaveProperty('radius', 250);
+      expect(response.body.location).toEqual({ type: 'Point', coordinates: [6.1424, 46.2102] });
+      expect(response.body.createdBy).toHaveProperty('_id', adminProfile._id);
+
+      const zoneInDb = await Zone.findById(response.body._id);
+      expect(zoneInDb).not.toBeNull();
+      expect(zoneInDb.createdBy.toString()).toBe(adminProfile._id);
+    });
+
+    it('devrait accepter le format raccourci { lng, lat } (201)', async () => {
+      const response = await request(app)
+        .post('/api/zones')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: 'Lac de Neuchâtel', lng: 6.9, lat: 46.9 });
+
+      expect(response.status).toBe(201);
+      expect(response.body.location).toEqual({ type: 'Point', coordinates: [6.9, 46.9] });
+      expect(response.body).toHaveProperty('radius', 500);
+    });
+
+    it('devrait rejeter la création sans jeton (401)', async () => {
+      const response = await request(app).post('/api/zones').send(newZoneBody());
+
+      expect(response.status).toBe(401);
+      expect(response.headers['www-authenticate']).toContain('Bearer');
+    });
+
+    it('devrait rejeter la création par un simple membre (403)', async () => {
+      const response = await request(app)
+        .post('/api/zones')
+        .set('Authorization', `Bearer ${userToken}`)
+        .send(newZoneBody());
+
+      expect(response.status).toBe(403);
+      expect(await Zone.countDocuments()).toBe(2);
+    });
+
+    it('devrait rejeter des coordonnées invalides (latitude > 90) avec un code 400', async () => {
+      const response = await request(app)
+        .post('/api/zones')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ ...newZoneBody(), location: { type: 'Point', coordinates: [6.1424, 95] } });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error');
+      expect(await Zone.countDocuments()).toBe(2);
+    });
+
+    it('devrait rejeter une création sans coordonnées avec un code 400', async () => {
+      const { location, ...bodyWithoutLocation } = newZoneBody();
+      const response = await request(app)
+        .post('/api/zones')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send(bodyWithoutLocation);
+
+      expect(response.status).toBe(400);
+    });
+
+    it('devrait rejeter un rayon inférieur à 10 mètres avec un code 400', async () => {
+      const response = await request(app)
+        .post('/api/zones')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ ...newZoneBody(), radius: 5 });
+
+      expect(response.status).toBe(400);
+    });
+
+    it('devrait rejeter un nom de zone en doublon avec un code 409', async () => {
+      const response = await request(app)
+        .post('/api/zones')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ ...newZoneBody(), name: 'HEIG-VD Yverdon' });
+
+      expect(response.status).toBe(409);
+      expect(response.body).toHaveProperty('error');
+    });
+  });
+
+  describe('PATCH /api/zones/:id', () => {
+    it('devrait permettre à un administrateur de modifier une zone (200)', async () => {
+      const response = await request(app)
+        .patch(`/api/zones/${zoneYverdon._id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          description: 'Campus de Cheseaux',
+          radius: 800,
+          location: { type: 'Point', coordinates: [6.6596, 46.7792] }
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveProperty('name', 'HEIG-VD Yverdon');
+      expect(response.body).toHaveProperty('description', 'Campus de Cheseaux');
+      expect(response.body).toHaveProperty('radius', 800);
+      expect(response.body.location.coordinates).toEqual([6.6596, 46.7792]);
+
+      const zoneInDb = await Zone.findById(zoneYverdon._id);
+      expect(zoneInDb.radius).toBe(800);
+    });
+
+    it('devrait rejeter la modification par un non-admin (403)', async () => {
+      const response = await request(app)
+        .patch(`/api/zones/${zoneYverdon._id}`)
+        .set('Authorization', `Bearer ${userToken}`)
+        .send({ radius: 800 });
+
+      expect(response.status).toBe(403);
+      const zoneInDb = await Zone.findById(zoneYverdon._id);
+      expect(zoneInDb.radius).toBe(500);
+    });
+
+    it('devrait renvoyer 404 si la zone à modifier n’existe pas', async () => {
+      const response = await request(app)
+        .patch(`/api/zones/${unknownId}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ radius: 800 });
+
+      expect(response.status).toBe(404);
+    });
+
+    it('devrait rejeter un renommage vers un nom déjà utilisé avec un code 409', async () => {
+      const response = await request(app)
+        .patch(`/api/zones/${zoneYverdon._id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: 'Place Chauderon' });
+
+      expect(response.status).toBe(409);
+    });
+
+    it('devrait rejeter des coordonnées invalides avec un code 400', async () => {
+      const response = await request(app)
+        .patch(`/api/zones/${zoneYverdon._id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ coordinates: [-181, 46] });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe('DELETE /api/zones/:id', () => {
+    it('devrait permettre à un administrateur de supprimer une zone (204)', async () => {
+      const response = await request(app)
+        .delete(`/api/zones/${zoneLausanne._id}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(response.status).toBe(204);
+      expect(response.body).toEqual({});
+      expect(await Zone.findById(zoneLausanne._id)).toBeNull();
+    });
+
+    it('devrait rejeter la suppression par un non-admin (403)', async () => {
+      const response = await request(app)
+        .delete(`/api/zones/${zoneLausanne._id}`)
+        .set('Authorization', `Bearer ${userToken}`);
+
+      expect(response.status).toBe(403);
+      expect(await Zone.findById(zoneLausanne._id)).not.toBeNull();
+    });
+
+    it('devrait renvoyer 404 si la zone à supprimer n’existe pas', async () => {
+      const response = await request(app)
+        .delete(`/api/zones/${unknownId}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(response.status).toBe(404);
+    });
+  });
+});
