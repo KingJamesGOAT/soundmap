@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import mongoose from 'mongoose';
 import { authenticate } from '../middlewares/auth.js';
 import Music from '../models/Music.js';
 import Zone from '../models/Zone.js';
@@ -308,13 +309,136 @@ router.post('/:id/vote', authenticate, async (req, res, next) => {
 });
 
 /**
- * STUB POUR NABIL (GET /api/musics)
+ * Échappe les caractères spéciaux d'une chaîne pour l'utiliser dans une expression régulière.
+ * Évite qu'une saisie comme "a.b" ou "(" soit interprétée comme une regex (ou fasse planter la requête).
+ *
+ * @param {string} text - Texte saisi par le client
+ * @returns {string} Texte échappé
  */
-router.get('/', (req, res) => {
-  res.status(501).json({
-    message: "Route de liste paginée des musiques non implémentée (Attribuée à Nabil).",
-    route: "GET /api/musics"
-  });
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Lit un paramètre de pagination : renvoie la valeur par défaut s'il est absent,
+ * sinon un entier >= 1, ou null si la valeur est invalide.
+ */
+function parsePositiveInt(value, defaultValue) {
+  if (value === undefined || value === '') return defaultValue;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= 1 ? number : null;
+}
+
+// Limite maximale d'éléments par page pour éviter des réponses trop lourdes
+const MAX_PAGE_SIZE = 50;
+
+/**
+ * @route   GET /api/musics
+ * @desc    Lister les musiques avec pagination, filtres (zone, genre, recherche) et tri
+ * @access  Public
+ * @dev     Nabil
+ *
+ * Paramètres de requête :
+ *   - page             : numéro de page (défaut 1)
+ *   - limit / pageSize : éléments par page (défaut 10, plafonné à 50)
+ *   - zone             : identifiant MongoDB de la zone
+ *   - genre            : genre exact, insensible à la casse
+ *   - search           : recherche dans le titre OU l'artiste, insensible à la casse
+ *   - sort             : "recent" (défaut, plus récentes d'abord) ou "popular" (meilleur score d'abord)
+ */
+router.get('/', async (req, res, next) => {
+  try {
+    const { zone, genre, search, sort = 'recent' } = req.query;
+
+    // 1. Validation de la pagination
+    const page = parsePositiveInt(req.query.page, 1);
+    const requestedLimit = parsePositiveInt(req.query.limit ?? req.query.pageSize, 10);
+
+    if (page === null || requestedLimit === null) {
+      return res.status(400).json({
+        error: 'Les paramètres "page" et "limit" (ou "pageSize") doivent être des entiers supérieurs ou égaux à 1.'
+      });
+    }
+    const limit = Math.min(requestedLimit, MAX_PAGE_SIZE);
+
+    if (sort !== 'recent' && sort !== 'popular') {
+      return res.status(400).json({
+        error: 'Le paramètre "sort" doit valoir "recent" ou "popular".'
+      });
+    }
+
+    // Un paramètre répété (ex: ?genre=a&genre=b) arrive sous forme de tableau : on le refuse
+    if ([genre, search].some((value) => value !== undefined && typeof value !== 'string')) {
+      return res.status(400).json({ error: 'Les paramètres "genre" et "search" doivent être des textes simples.' });
+    }
+
+    // 2. Construction des filtres
+    const query = {};
+
+    if (zone !== undefined) {
+      if (!mongoose.isValidObjectId(zone)) {
+        return res.status(400).json({ error: `L'identifiant de zone "${zone}" est invalide.` });
+      }
+      // Conversion explicite : le pipeline d'agrégation ne convertit pas les chaînes en ObjectId
+      query.zone = new mongoose.Types.ObjectId(zone);
+    }
+
+    if (genre) {
+      query.genre = { $regex: `^${escapeRegex(genre)}$`, $options: 'i' };
+    }
+
+    if (search) {
+      const pattern = { $regex: escapeRegex(search), $options: 'i' };
+      query.$or = [{ title: pattern }, { artist: pattern }];
+    }
+
+    // 3. Tri : le score (upvotes - downvotes) n'existe pas en base,
+    //    on le calcule donc dans un pipeline d'agrégation avant de trier.
+    const sortStage =
+      sort === 'popular'
+        ? { sortScore: -1, createdAt: -1, _id: -1 }
+        : { createdAt: -1, _id: -1 };
+
+    const [rawMusics, totalItems] = await Promise.all([
+      Music.aggregate([
+        { $match: query },
+        {
+          $addFields: {
+            sortScore: {
+              $subtract: [
+                { $size: { $ifNull: ['$upvotes', []] } },
+                { $size: { $ifNull: ['$downvotes', []] } }
+              ]
+            }
+          }
+        },
+        { $sort: sortStage },
+        { $skip: (page - 1) * limit },
+        { $limit: limit },
+        { $unset: 'sortScore' }
+      ]),
+      Music.countDocuments(query)
+    ]);
+
+    // 4. Reconversion en documents Mongoose (pour le score virtuel et toJSON), puis peuplement
+    const musics = await Music.populate(
+      rawMusics.map((doc) => Music.hydrate(doc)),
+      [
+        { path: 'postedBy', select: 'username role' },
+        { path: 'zone', select: 'name location radius' }
+      ]
+    );
+
+    return res.status(200).json({
+      page,
+      limit,
+      totalItems,
+      totalPages: Math.ceil(totalItems / limit),
+      data: musics
+    });
+  } catch (err) {
+    return next(err);
+  }
 });
 
 export default router;

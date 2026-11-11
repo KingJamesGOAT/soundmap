@@ -485,3 +485,302 @@ describe('API SoundMap - Tests Musiques, Dépôt GPS & Votes (Ryad)', () => {
   });
 
 });
+
+describe('API SoundMap - Tests Consultation Paginée & Statistiques (Nabil)', () => {
+  let alice;
+  let bob;
+  let zoneYverdon;
+  let zoneLausanne;
+
+  /**
+   * Jeu de données inséré directement en base (sans passer par POST /api/musics)
+   * afin de maîtriser les votes et les dates de création :
+   *
+   * | Titre                   | Artiste     | Genre   | Zone     | Up | Down | Score |
+   * |-------------------------|-------------|---------|----------|----|------|-------|
+   * | Around the World        | Daft Punk   | Electro | Yverdon  | 2  | 0    | 2     |
+   * | Get Lucky               | Daft Punk   | electro | Yverdon  | 1  | 1    | 0     |
+   * | Bohemian Rhapsody       | Queen       | Rock    | Lausanne | 0  | 1    | -1    |
+   * | Smells Like Teen Spirit | Nirvana     | Rock    | Yverdon  | 1  | 0    | 1     |
+   * | So What                 | Miles Davis | Jazz    | Lausanne | 0  | 0    | 0     |
+   *
+   * Les musiques sont listées de la plus ancienne à la plus récente.
+   */
+  beforeEach(async () => {
+    alice = await User.create({ username: 'alice', passwordHash: 'hash-inutile-pour-ces-tests' });
+    bob = await User.create({ username: 'bob', passwordHash: 'hash-inutile-pour-ces-tests' });
+
+    zoneYverdon = await Zone.create({
+      name: 'HEIG-VD Yverdon',
+      location: { type: 'Point', coordinates: [6.6412, 46.7785] },
+      radius: 500,
+      createdBy: alice._id
+    });
+    zoneLausanne = await Zone.create({
+      name: 'Place Chauderon',
+      location: { type: 'Point', coordinates: [6.6243, 46.5225] },
+      radius: 300,
+      createdBy: alice._id
+    });
+
+    const musics = [
+      { title: 'Around the World', artist: 'Daft Punk', genre: 'Electro', zone: zoneYverdon, upvotes: [alice, bob], downvotes: [] },
+      { title: 'Get Lucky', artist: 'Daft Punk', genre: 'electro', zone: zoneYverdon, upvotes: [alice], downvotes: [bob] },
+      { title: 'Bohemian Rhapsody', artist: 'Queen', genre: 'Rock', zone: zoneLausanne, upvotes: [], downvotes: [alice] },
+      { title: 'Smells Like Teen Spirit', artist: 'Nirvana', genre: 'Rock', zone: zoneYverdon, upvotes: [bob], downvotes: [] },
+      { title: 'So What', artist: 'Miles Davis', genre: 'Jazz', zone: zoneLausanne, upvotes: [], downvotes: [] }
+    ];
+
+    // Dates espacées d'une minute pour que le tri "recent" soit déterministe
+    const baseDate = new Date('2026-01-01T12:00:00Z').getTime();
+    await Music.insertMany(
+      musics.map((music, index) => ({
+        ...music,
+        url: 'https://example.com/ecouter',
+        zone: music.zone._id,
+        postedBy: alice._id,
+        upvotes: music.upvotes.map((user) => user._id),
+        downvotes: music.downvotes.map((user) => user._id),
+        createdAt: new Date(baseDate + index * 60000)
+      }))
+    );
+  });
+
+  // Raccourci : liste des titres d'une réponse paginée
+  const titles = (response) => response.body.data.map((music) => music.title);
+
+  describe('GET /api/musics (Liste paginée et filtrable)', () => {
+    it('devrait paginer les résultats (page 1, limit 2) avec les métadonnées exactes (200)', async () => {
+      const response = await request(app).get('/api/musics?page=1&limit=2');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ page: 1, limit: 2, totalItems: 5, totalPages: 3 });
+      // Tri par défaut "recent" : les deux dernières musiques insérées
+      expect(titles(response)).toEqual(['So What', 'Smells Like Teen Spirit']);
+    });
+
+    it('devrait renvoyer la dernière page partiellement remplie', async () => {
+      const response = await request(app).get('/api/musics?page=3&limit=2');
+
+      expect(response.status).toBe(200);
+      expect(titles(response)).toEqual(['Around the World']);
+    });
+
+    it('devrait renvoyer un tableau vide au-delà de la dernière page', async () => {
+      const response = await request(app).get('/api/musics?page=10&limit=2');
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toEqual([]);
+      expect(response.body.totalItems).toBe(5);
+    });
+
+    it('devrait appliquer les valeurs par défaut (page 1, limit 10)', async () => {
+      const response = await request(app).get('/api/musics');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ page: 1, limit: 10, totalItems: 5, totalPages: 1 });
+      expect(response.body.data).toHaveLength(5);
+    });
+
+    it('devrait accepter "pageSize" comme alias de "limit"', async () => {
+      const response = await request(app).get('/api/musics?pageSize=3');
+
+      expect(response.status).toBe(200);
+      expect(response.body.limit).toBe(3);
+      expect(response.body.data).toHaveLength(3);
+    });
+
+    it('devrait plafonner "limit" à 50 éléments par page', async () => {
+      const response = await request(app).get('/api/musics?limit=1000');
+
+      expect(response.status).toBe(200);
+      expect(response.body.limit).toBe(50);
+    });
+
+    it('devrait peupler l’auteur et la zone, calculer le score et masquer le mot de passe', async () => {
+      const response = await request(app).get('/api/musics?search=around');
+      const [music] = response.body.data;
+
+      expect(music.postedBy).toMatchObject({ username: 'alice', role: 'user' });
+      expect(music.postedBy).not.toHaveProperty('passwordHash');
+      expect(music.zone).toMatchObject({ name: 'HEIG-VD Yverdon', radius: 500 });
+      expect(music.zone.location.coordinates).toEqual([6.6412, 46.7785]);
+      expect(music.score).toBe(2);
+      expect(music).not.toHaveProperty('sortScore');
+    });
+
+    it.each([
+      ['page=-1', 'page négative'],
+      ['page=0', 'page nulle'],
+      ['page=1.5', 'page décimale'],
+      ['page=abc', 'page non numérique'],
+      ['limit=abc', 'limit non numérique'],
+      ['limit=0', 'limit nulle'],
+      ['pageSize=-5', 'pageSize négatif']
+    ])('devrait rejeter une pagination invalide (%s : %s) avec un code 400', async (queryString) => {
+      const response = await request(app).get(`/api/musics?${queryString}`);
+
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error');
+    });
+
+    it('devrait filtrer par genre sans tenir compte de la casse (genre=Electro)', async () => {
+      const response = await request(app).get('/api/musics?genre=Electro');
+
+      expect(response.status).toBe(200);
+      expect(response.body.totalItems).toBe(2);
+      expect(titles(response).sort()).toEqual(['Around the World', 'Get Lucky']);
+    });
+
+    it('devrait exiger le genre exact (genre=Elec ne renvoie rien)', async () => {
+      const response = await request(app).get('/api/musics?genre=Elec');
+
+      expect(response.status).toBe(200);
+      expect(response.body.totalItems).toBe(0);
+      expect(response.body.totalPages).toBe(0);
+    });
+
+    it('devrait filtrer par zone (zone=<id>)', async () => {
+      const response = await request(app).get(`/api/musics?zone=${zoneLausanne._id}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.totalItems).toBe(2);
+      response.body.data.forEach((music) => {
+        expect(music.zone._id).toBe(zoneLausanne._id.toString());
+      });
+    });
+
+    it('devrait renvoyer une liste vide pour une zone valide mais inexistante', async () => {
+      const unknownZoneId = new mongoose.Types.ObjectId();
+      const response = await request(app).get(`/api/musics?zone=${unknownZoneId}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.data).toEqual([]);
+    });
+
+    it('devrait rejeter un identifiant de zone mal formé avec un code 400', async () => {
+      const response = await request(app).get('/api/musics?zone=pas-un-id');
+
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error');
+    });
+
+    it('devrait combiner plusieurs filtres (zone + genre)', async () => {
+      const response = await request(app).get(`/api/musics?zone=${zoneYverdon._id}&genre=rock`);
+
+      expect(response.status).toBe(200);
+      expect(titles(response)).toEqual(['Smells Like Teen Spirit']);
+    });
+
+    it('devrait rechercher dans l’artiste sans tenir compte de la casse (search=daft)', async () => {
+      const response = await request(app).get('/api/musics?search=daft');
+
+      expect(response.status).toBe(200);
+      expect(response.body.totalItems).toBe(2);
+      expect(titles(response).sort()).toEqual(['Around the World', 'Get Lucky']);
+    });
+
+    it('devrait rechercher aussi dans le titre (search=SPIRIT)', async () => {
+      const response = await request(app).get('/api/musics?search=SPIRIT');
+
+      expect(response.status).toBe(200);
+      expect(titles(response)).toEqual(['Smells Like Teen Spirit']);
+    });
+
+    it('devrait traiter les caractères spéciaux de la recherche comme du texte (pas de crash)', async () => {
+      const response = await request(app).get('/api/musics?search=' + encodeURIComponent('(['));
+
+      expect(response.status).toBe(200);
+      expect(response.body.totalItems).toBe(0);
+    });
+
+    it('devrait rejeter un filtre répété (genre=a&genre=b) avec un code 400', async () => {
+      const response = await request(app).get('/api/musics?genre=Rock&genre=Jazz');
+
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error');
+    });
+
+    it('devrait trier par popularité (sort=popular) du meilleur au pire score', async () => {
+      const response = await request(app).get('/api/musics?sort=popular');
+
+      expect(response.status).toBe(200);
+      expect(response.body.data.map((music) => music.score)).toEqual([2, 1, 0, 0, -1]);
+      expect(titles(response)[0]).toBe('Around the World');
+      expect(titles(response)[4]).toBe('Bohemian Rhapsody');
+    });
+
+    it('devrait rejeter une valeur de tri inconnue avec un code 400', async () => {
+      const response = await request(app).get('/api/musics?sort=alphabetique');
+
+      expect(response.status).toBe(400);
+      expect(response.body).toHaveProperty('error');
+    });
+  });
+
+  describe('GET /api/zones/stats/overview (Agrégation MongoDB)', () => {
+    it('devrait répondre 200 avec la structure globalStats / zonesStats', async () => {
+      const response = await request(app).get('/api/zones/stats/overview');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toHaveProperty('globalStats');
+      expect(response.body).toHaveProperty('zonesStats');
+      expect(response.body.globalStats).toEqual({ totalMusics: 5, totalUsers: 2 });
+      expect(response.body.zonesStats).toHaveLength(2);
+    });
+
+    it('devrait calculer exactement les compteurs de musiques et de votes par zone', async () => {
+      const response = await request(app).get('/api/zones/stats/overview');
+      const [yverdon, lausanne] = response.body.zonesStats;
+
+      // Tri par nombre de musiques décroissant : Yverdon (3) avant Lausanne (2)
+      expect(yverdon).toMatchObject({
+        zoneId: zoneYverdon._id.toString(),
+        zoneName: 'HEIG-VD Yverdon',
+        totalMusics: 3,
+        totalUpvotes: 4,
+        totalDownvotes: 1,
+        averageScore: 1
+      });
+      expect(yverdon.genres.sort()).toEqual(['Electro', 'Rock', 'electro']);
+
+      expect(lausanne).toMatchObject({
+        zoneId: zoneLausanne._id.toString(),
+        zoneName: 'Place Chauderon',
+        totalMusics: 2,
+        totalUpvotes: 0,
+        totalDownvotes: 1,
+        averageScore: -0.5
+      });
+      expect(lausanne.genres.sort()).toEqual(['Jazz', 'Rock']);
+    });
+
+    it('devrait être accessible aussi via /api/stats/overview', async () => {
+      const response = await request(app).get('/api/stats/overview');
+
+      expect(response.status).toBe(200);
+      expect(response.body.globalStats.totalMusics).toBe(5);
+    });
+
+    it('devrait conserver les musiques d’une zone supprimée (zoneName absent)', async () => {
+      await Zone.findByIdAndDelete(zoneLausanne._id);
+      const response = await request(app).get('/api/zones/stats/overview');
+      const orphan = response.body.zonesStats.find(
+        (stats) => stats.zoneId === zoneLausanne._id.toString()
+      );
+
+      expect(response.status).toBe(200);
+      expect(orphan.totalMusics).toBe(2);
+      expect(orphan).not.toHaveProperty('zoneName');
+    });
+
+    it('devrait renvoyer des statistiques vides si la base ne contient aucune musique', async () => {
+      await Music.deleteMany({});
+      const response = await request(app).get('/api/zones/stats/overview');
+
+      expect(response.status).toBe(200);
+      expect(response.body.globalStats).toEqual({ totalMusics: 0, totalUsers: 2 });
+      expect(response.body.zonesStats).toEqual([]);
+    });
+  });
+});
