@@ -1,5 +1,10 @@
 import express from 'express';
 import cors from 'cors';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { load } from 'js-yaml';
+import swaggerUi from 'swagger-ui-express';
 
 // Importation des fichiers de routes
 import authRouter from './routes/auth.js';
@@ -11,6 +16,9 @@ import statsRouter from './routes/stats.js';
 // Importation du middleware centralisé de gestion des erreurs
 import { errorHandler } from './middlewares/errorHandler.js';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 /**
  * Initialisation de l'application Express.
  * Note académique : Ce fichier configure les middlewares et les routes mais n'appelle
@@ -18,6 +26,20 @@ import { errorHandler } from './middlewares/errorHandler.js';
  * et de séparer la configuration du démarrage du serveur HTTP.
  */
 const app = express();
+
+// ============================================================================
+// DOCUMENTATION INTERACTIVE OPENAPI / SWAGGER UI
+// Conforme au guide officiel du cours comem-archioweb/guides/api-documentation.md
+// ============================================================================
+try {
+  const openApiPath = path.join(__dirname, 'openapi.yml');
+  if (fs.existsSync(openApiPath)) {
+    const openApiDocument = load(fs.readFileSync(openApiPath, 'utf8'));
+    app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(openApiDocument));
+  }
+} catch (e) {
+  console.warn('⚠️ Impossible de charger la documentation Swagger :', e.message);
+}
 
 // ============================================================================
 // MIDDLEWARES GLOBAUX
@@ -44,6 +66,7 @@ app.get('/api', (req, res) => {
     message: "Bienvenue sur l'API SoundMap",
     version: '1.0.0',
     documentation: {
+      swagger: '/api-docs',
       auth: '/api/auth',
       users: '/api/users',
       zones: '/api/zones',

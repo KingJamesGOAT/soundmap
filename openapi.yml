@@ -1,0 +1,830 @@
+openapi: 3.0.3
+info:
+  title: SoundMap API
+  version: 1.0.0
+  description: |
+    API RESTful géolocalisée permettant de découvrir, écouter et voter pour des recommandations musicales rattachées à des zones géographiques ("Zones").
+    Développée dans le cadre du cours d'Architecture Web (ArchiOWeb - HEIG-VD / COMEM+).
+    Enseignants : Simon Oulevay & Loris Gavillet.
+servers:
+  - url: http://localhost:3000/api
+    description: Serveur de développement local
+  - url: https://soundmap-backend.onrender.com/api
+    description: Serveur de production (Render)
+
+tags:
+  - name: Authentification
+    description: Gestion des sessions et émission des jetons JWT (Steve)
+  - name: Utilisateurs
+    description: Inscription et profils des utilisateurs (Steve)
+  - name: Musiques
+    description: Dépôt géolocalisé, votes interactifs et consultation paginée (Ryad & Nabil)
+  - name: Zones
+    description: Gestion spatiale GeoJSON et administration des zones (Luka)
+  - name: Statistiques
+    description: Agrégation MongoDB calculant les scores et métriques par zone (Nabil)
+
+paths:
+  /auth/login:
+    post:
+      tags:
+        - Authentification
+      summary: Connexion d'un utilisateur et obtention d'un jeton JWT
+      description: Vérifie les identifiants et renvoie un jeton JWT valide (expiration 7 jours) ainsi que les informations publiques de l'utilisateur.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+                - password
+              properties:
+                username:
+                  type: string
+                  example: alice
+                password:
+                  type: string
+                  example: password123
+      responses:
+        '200':
+          description: Connexion réussie
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  user:
+                    $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users:
+    post:
+      tags:
+        - Utilisateurs
+      summary: Inscription d'un nouvel utilisateur
+      description: Crée un nouveau compte utilisateur. Le mot de passe est haché avec bcrypt et jamais renvoyé en clair.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+                - password
+              properties:
+                username:
+                  type: string
+                  minLength: 3
+                  maxLength: 30
+                  example: alice
+                password:
+                  type: string
+                  minLength: 4
+                  example: password123
+                role:
+                  type: string
+                  enum: [user, admin]
+                  default: user
+      responses:
+        '201':
+          description: Utilisateur créé avec succès
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    get:
+      tags:
+        - Utilisateurs
+      summary: Lister tous les utilisateurs
+      description: Renvoie la liste publique des membres sans informations sensibles.
+      responses:
+        '200':
+          description: Liste des utilisateurs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/User'
+
+  /users/me:
+    get:
+      tags:
+        - Utilisateurs
+      summary: Récupérer le profil de l'utilisateur connecté
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Profil de l'utilisateur
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users/{id}:
+    get:
+      tags:
+        - Utilisateurs
+      summary: Récupérer un utilisateur par son identifiant
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Identifiant MongoDB de l'utilisateur
+      responses:
+        '200':
+          description: Utilisateur trouvé
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /musics:
+    get:
+      tags:
+        - Musiques
+      summary: Lister les musiques avec pagination et filtres
+      description: Renvoie la liste paginée des morceaux musicaux selon des filtres dynamiques (zone, genre, recherche plein texte) et critères de tri.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Numéro de page
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 50
+          description: Nombre d'éléments par page (alias pageSize)
+        - name: zone
+          in: query
+          schema:
+            type: string
+          description: Filtrer par identifiant MongoDB de zone
+        - name: genre
+          in: query
+          schema:
+            type: string
+          description: Filtrer par genre musical exact (insensible à la casse)
+        - name: search
+          in: query
+          schema:
+            type: string
+          description: Recherche textuelle dans le titre ou l'artiste
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [recent, popular]
+            default: recent
+          description: Tri chronologique (recent) ou par score net décroissant (popular)
+      responses:
+        '200':
+          description: Liste paginée des musiques
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  page:
+                    type: integer
+                    example: 1
+                  limit:
+                    type: integer
+                    example: 10
+                  totalItems:
+                    type: integer
+                    example: 42
+                  totalPages:
+                    type: integer
+                    example: 5
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Music'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    post:
+      tags:
+        - Musiques
+      summary: Déposer une musique dans une zone (Vérification GPS requise)
+      description: Dépose un nouveau morceau dans une zone. L'utilisateur doit obligatoirement être authentifié et ses coordonnées GPS doivent se trouver dans le rayon de la zone.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - title
+                - artist
+                - url
+                - zoneId
+                - userCoordinates
+              properties:
+                title:
+                  type: string
+                  example: Get Lucky
+                artist:
+                  type: string
+                  example: Daft Punk
+                genre:
+                  type: string
+                  example: Electro
+                url:
+                  type: string
+                  example: https://open.spotify.com/track/69kOkLUCkxIZYexIgSG8a2
+                links:
+                  type: object
+                  properties:
+                    spotify:
+                      type: string
+                    appleMusic:
+                      type: string
+                    youtubeMusic:
+                      type: string
+                zoneId:
+                  type: string
+                  description: Identifiant MongoDB de la zone cible
+                  example: 6731f0c2a1b2c3d4e5f60701
+                userCoordinates:
+                  type: array
+                  items:
+                    type: number
+                  minItems: 2
+                  maxItems: 2
+                  description: Coordonnées GPS de l'utilisateur [longitude, latitude]
+                  example: [6.6413, 46.7786]
+      responses:
+        '201':
+          description: Musique créée avec succès
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Music'
+        '400':
+          description: Requête invalide ou utilisateur hors de portée géographique
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Dépôt refusé : vous êtes situé trop loin du centre de la zone"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: La zone spécifiée n'existe pas
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /musics/{id}:
+    get:
+      tags:
+        - Musiques
+      summary: Récupérer les détails d'une musique par ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Détails de la musique
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Music'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+        - Musiques
+      summary: Mettre à jour une musique (Auteur ou Admin uniquement)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                artist:
+                  type: string
+                genre:
+                  type: string
+                url:
+                  type: string
+                links:
+                  type: object
+      responses:
+        '200':
+          description: Musique mise à jour
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Music'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - Musiques
+      summary: Supprimer une musique (Auteur ou Admin uniquement)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Musique supprimée avec succès (No Content)
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /musics/{id}/vote:
+    post:
+      tags:
+        - Musiques
+      summary: Voter pour un morceau (Upvote / Downvote interactif)
+      description: Enregistre un vote. Si le même vote est renvoyé, il est annulé (toggle). Si le vote inverse est renvoyé, il bascule sans doublon.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - type
+              properties:
+                type:
+                  type: string
+                  enum: [up, down, upvote, downvote]
+                  example: up
+      responses:
+        '200':
+          description: Vote enregistré
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Vote enregistré avec succès.
+                  musicId:
+                    type: string
+                  score:
+                    type: integer
+                    example: 1
+                  upvotesCount:
+                    type: integer
+                    example: 1
+                  downvotesCount:
+                    type: integer
+                    example: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /zones:
+    get:
+      tags:
+        - Zones
+      summary: Lister les zones géographiques
+      description: Renvoie la liste des zones avec support optionnel de la proximité géographique (recherche géospatiale).
+      parameters:
+        - name: near
+          in: query
+          schema:
+            type: string
+          description: Coordonnées de recherche sous forme "longitude,latitude"
+          example: "6.6412,46.7785"
+        - name: maxDistance
+          in: query
+          schema:
+            type: number
+          description: Distance maximale en mètres autour du point (par défaut 50000m)
+      responses:
+        '200':
+          description: Liste des zones
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Zone'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    post:
+      tags:
+        - Zones
+      summary: Créer une zone (Admin uniquement)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  example: Campus HEIG-VD Yverdon
+                description:
+                  type: string
+                  example: Site de Cheseaux
+                location:
+                  $ref: '#/components/schemas/GeoJSONPoint'
+                coordinates:
+                  type: array
+                  items:
+                    type: number
+                  example: [6.6412, 46.7785]
+                radius:
+                  type: number
+                  default: 500
+                  minimum: 10
+                  example: 500
+      responses:
+        '201':
+          description: Zone créée avec succès
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Zone'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /zones/{id}:
+    get:
+      tags:
+        - Zones
+      summary: Récupérer une zone par ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Détails de la zone
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Zone'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+        - Zones
+      summary: Modifier une zone (Admin uniquement)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                description:
+                  type: string
+                radius:
+                  type: number
+                location:
+                  $ref: '#/components/schemas/GeoJSONPoint'
+      responses:
+        '200':
+          description: Zone mise à jour
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Zone'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags:
+        - Zones
+      summary: Supprimer une zone (Admin uniquement)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Zone supprimée avec succès
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /zones/stats/overview:
+    get:
+      tags:
+        - Statistiques
+      summary: Vue d'ensemble statistique par agrégation MongoDB
+      description: Utilise un pipeline $aggregate pour calculer le total de musiques, upvotes, downvotes et score moyen par zone géographique.
+      responses:
+        '200':
+          description: Statistiques calculées
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  globalStats:
+                    type: object
+                    properties:
+                      totalMusics:
+                        type: integer
+                      totalUsers:
+                        type: integer
+                  zonesStats:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        zoneId:
+                          type: string
+                        zoneName:
+                          type: string
+                        totalMusics:
+                          type: integer
+                        totalUpvotes:
+                          type: integer
+                        totalDownvotes:
+                          type: integer
+                        averageScore:
+                          type: number
+                        genres:
+                          type: array
+                          items:
+                            type: string
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    BadRequest:
+      description: Requête invalide (données ou paramètres malformés)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Erreur de validation des données.
+    Unauthorized:
+      description: Authentification requise ou jeton invalide
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Accès refusé. Un jeton d'authentification est requis.
+    Forbidden:
+      description: Droits insuffisants (administrateur ou auteur requis)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Accès interdit. Cette action nécessite des privilèges administrateur.
+    NotFound:
+      description: Ressource introuvable
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Aucune ressource trouvée avec cet identifiant.
+    Conflict:
+      description: Conflit de données (valeur unique déjà existante)
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+                example: Conflit de données.
+
+  schemas:
+    GeoJSONPoint:
+      type: object
+      required:
+        - type
+        - coordinates
+      properties:
+        type:
+          type: string
+          enum: [Point]
+          example: Point
+        coordinates:
+          type: array
+          items:
+            type: number
+          minItems: 2
+          maxItems: 2
+          description: Coordonnées sous forme [longitude, latitude]
+          example: [6.6412, 46.7785]
+
+    User:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: 6731f0c2a1b2c3d4e5f60700
+        username:
+          type: string
+          example: alice
+        role:
+          type: string
+          enum: [user, admin]
+          example: user
+        createdAt:
+          type: string
+          format: date-time
+
+    Zone:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: 6731f0c2a1b2c3d4e5f60701
+        name:
+          type: string
+          example: Campus HEIG-VD Yverdon
+        description:
+          type: string
+          example: Site de Cheseaux
+        location:
+          $ref: '#/components/schemas/GeoJSONPoint'
+        radius:
+          type: number
+          example: 500
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+
+    Music:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: 6731f0c2a1b2c3d4e5f60718
+        title:
+          type: string
+          example: Get Lucky
+        artist:
+          type: string
+          example: Daft Punk
+        genre:
+          type: string
+          example: Electro
+        url:
+          type: string
+          example: https://open.spotify.com/track/69kOkLUCkxIZYexIgSG8a2
+        links:
+          type: object
+          properties:
+            spotify:
+              type: string
+            appleMusic:
+              type: string
+            youtubeMusic:
+              type: string
+        zone:
+          type: string
+          example: 6731f0c2a1b2c3d4e5f60701
+        postedBy:
+          type: string
+          example: 6731f0c2a1b2c3d4e5f60700
+        score:
+          type: integer
+          example: 5
+        upvotes:
+          type: array
+          items:
+            type: string
+        downvotes:
+          type: array
+          items:
+            type: string
+        createdAt:
+          type: string
+          format: date-time

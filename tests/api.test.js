@@ -41,6 +41,11 @@ describe('API SoundMap - Tests Authentification & Utilisateurs (Steve)', () => {
     expect(response.body).toHaveProperty('error');
   });
 
+  it('GET /api-docs devrait servir l’interface Swagger UI de documentation (200 ou 301)', async () => {
+    const response = await request(app).get('/api-docs/');
+    expect([200, 301]).toContain(response.status);
+  });
+
   describe('POST /api/users (Inscription)', () => {
     it('devrait créer un nouvel utilisateur avec succès (201) et masquer son mot de passe', async () => {
       const response = await request(app)
